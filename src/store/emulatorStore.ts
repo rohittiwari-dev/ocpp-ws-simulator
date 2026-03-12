@@ -479,6 +479,59 @@ const DEFAULT_STATION_CONFIG: StationConfigKey[] = [
   { key: "UnlockConnectorOnEVSideDisconnect", readonly: true, value: "true" },
 ];
 
+// ─── Measurand → OCPP name map ──────────────────────────────────────────────
+
+const MEASURAND_OCPP_NAMES: Record<keyof MeasurandsConfig, string | null> = {
+  energy: "Energy.Active.Import.Register",
+  power: "Power.Active.Import",
+  soc: "SoC",
+  voltage: "Voltage",
+  current: "Current.Import",
+  temperature: "Temperature",
+  frequency: "Frequency",
+  threePhase: null, // not a measurand itself – controls phase routing
+};
+
+/**
+ * Recomputes the subset of stationConfig keys whose values are
+ * _derived_ from other parts of EmulatorConfig, and returns the
+ * updated stationConfig array.  Call this any time numberOfConnectors
+ * or simulation.measurands changes.
+ */
+function syncDerivedKeys(
+  config: Pick<EmulatorConfig, "numberOfConnectors" | "simulation" | "stationConfig">,
+): StationConfigKey[] {
+  const m = config.simulation?.measurands;
+
+  // Build MeterValuesSampledData value from active measurands
+  const sampledData = m
+    ? (Object.entries(MEASURAND_OCPP_NAMES) as [keyof MeasurandsConfig, string | null][])
+        .filter(([key, name]) => name !== null && m[key])
+        .map(([, name]) => name as string)
+        .join(",")
+    : "Energy.Active.Import.Register,Power.Active.Import";
+
+  // ConnectorPhaseRotation: one entry per connector, per phase config
+  const n = config.numberOfConnectors ?? 1;
+  const phaseStr = m?.threePhase
+    ? Array.from({ length: n }, (_, i) => `${i + 1}.NotApplicable`)
+        .flatMap((prefix) =>
+          ["L1", "L2", "L3"].map((ph) => `${prefix}`),
+        )
+        .join(",")
+    : Array.from({ length: n }, (_, i) => `${i + 1}.NotApplicable`).join(",");
+
+  const overrides: Record<string, string> = {
+    NumberOfConnectors: String(n),
+    MeterValuesSampledData: sampledData || "Energy.Active.Import.Register",
+    ConnectorPhaseRotation: phaseStr,
+  };
+
+  return config.stationConfig.map((k) =>
+    k.key in overrides ? { ...k, value: overrides[k.key] } : k,
+  );
+}
+
 const DEFAULT_SIMULATION: SimulationConfig = {
   diagnosticFileName: "diagnostics.csv",
   diagnosticUploadTime: 30,
@@ -499,8 +552,12 @@ const makeDefaultConfig = (index: number): EmulatorConfig => ({
   securityProfile: 0,
   basicAuthPassword: "",
   bootNotification: { ...DEFAULT_BOOT_NOTIFICATION },
-  stationConfig: DEFAULT_STATION_CONFIG.map((k) => ({ ...k })),
   simulation: { ...DEFAULT_SIMULATION, measurands: { ...DEFAULT_MEASURANDS } },
+  stationConfig: syncDerivedKeys({
+    numberOfConnectors: 1,
+    simulation: { ...DEFAULT_SIMULATION, measurands: { ...DEFAULT_MEASURANDS } },
+    stationConfig: DEFAULT_STATION_CONFIG.map((k) => ({ ...k })),
+  }),
   rfidTag: "DEADBEEF",
   numberOfConnectors: 1,
   vendorConfig: {
@@ -811,6 +868,11 @@ export const useEmulatorStore = create<EmulatorStore>()(
               };
             }
 
+            // Sync derived station config keys (e.g. NumberOfConnectors)
+            if (cfg.numberOfConnectors !== undefined) {
+              newConfig.stationConfig = syncDerivedKeys(newConfig);
+            }
+
             return {
               ...slot,
               config: newConfig,
@@ -848,13 +910,26 @@ export const useEmulatorStore = create<EmulatorStore>()(
 
       updateSimulation: (id, fields) =>
         set((s) => ({
-          chargers: updateSlot(s.chargers, id, (slot) => ({
-            ...slot,
-            config: {
-              ...slot.config,
-              simulation: { ...slot.config.simulation, ...fields },
-            },
-          })),
+          chargers: updateSlot(s.chargers, id, (slot) => {
+            const newSimulation = {
+              ...slot.config.simulation,
+              ...fields,
+              ...(fields.measurands
+                ? {
+                    measurands: {
+                      ...slot.config.simulation.measurands,
+                      ...fields.measurands,
+                    },
+                  }
+                : {}),
+            };
+            const newConfig = { ...slot.config, simulation: newSimulation };
+            // Re-sync MeterValuesSampledData / ConnectorPhaseRotation if measurands changed
+            if (fields.measurands !== undefined) {
+              newConfig.stationConfig = syncDerivedKeys(newConfig);
+            }
+            return { ...slot, config: newConfig };
+          }),
         })),
 
       updateVendorConfig: (id, fields) =>
