@@ -1061,19 +1061,54 @@ function SimulationTab() {
             className="h-9 bg-surface-inset border-b-default text-white text-[12px] rounded-lg focus-visible:ring-violet-500/30"
           />
         </Field>
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={simulation.autoChargeSocEnabled}
-            onChange={(e) =>
-              updateSimulation({ autoChargeSocEnabled: e.target.checked })
-            }
-            className="accent-violet-500 h-3.5 w-3.5 rounded"
-          />
-          <span className="text-[11px] text-t-muted">
-            Include SoC &amp; Temperature in MeterValues
-          </span>
-        </label>
+      </SectionCard>
+
+      {/* MeterValues Measurands */}
+      <SectionCard
+        title="MeterValues Measurands"
+        icon={<Gauge className="h-3.5 w-3.5" />}
+        color="text-cyan-400"
+        description="Choose which measurands are included in every MeterValues message"
+      >
+        <div className="grid grid-cols-3 gap-x-3 gap-y-2">
+          {(
+            [
+              { key: "energy", label: "Energy" },
+              { key: "power", label: "Power" },
+              { key: "soc", label: "SoC" },
+              { key: "voltage", label: "Voltage" },
+              { key: "current", label: "Current" },
+              { key: "temperature", label: "Temp" },
+              { key: "frequency", label: "Freq" },
+              { key: "threePhase", label: "3-Phase" },
+            ] as {
+              key: keyof NonNullable<typeof simulation.measurands>;
+              label: string;
+            }[]
+          ).map(({ key, label }) => (
+            <label
+              key={key}
+              className="flex items-center gap-1.5 cursor-pointer group"
+            >
+              <input
+                type="checkbox"
+                checked={simulation.measurands?.[key] ?? false}
+                onChange={(e) =>
+                  updateSimulation({
+                    measurands: {
+                      ...(simulation.measurands ?? {}),
+                      [key]: e.target.checked,
+                    },
+                  })
+                }
+                className="accent-cyan-500 h-3.5 w-3.5 rounded shrink-0"
+              />
+              <span className="text-[11px] text-t-muted group-hover:text-t-secondary transition-colors">
+                {label}
+              </span>
+            </label>
+          ))}
+        </div>
       </SectionCard>
 
       {/* Response Latency */}

@@ -413,10 +413,10 @@ export const DEFAULT_BOOT_NOTIFICATION: BootNotificationConfig = {
 export const DEFAULT_MEASURANDS: MeasurandsConfig = {
   energy: true,
   power: true,
-  soc: false,
-  voltage: false,
-  current: false,
-  temperature: false,
+  soc: true,
+  voltage: true,
+  current: true,
+  temperature: true,
   frequency: false,
   threePhase: false,
 };
