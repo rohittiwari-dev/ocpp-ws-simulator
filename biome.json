@@ -1,9 +1,13 @@
 {
-  "root": false,
   "$schema": "https://biomejs.dev/schemas/2.4.6/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!node_modules", "!.next", "!dist", "!build", "!.source"]
+    "includes": ["**", "!node_modules", "!.next", "!dist", "!build"]
   },
   "formatter": {
     "enabled": true,
@@ -15,30 +19,7 @@
     "rules": {
       "recommended": true,
       "suspicious": {
-        "noUnknownAtRules": "off",
-        "noExplicitAny": "off",
-        "useIterableCallbackReturn": "off"
-      },
-      "complexity": {
-        "noImportantStyles": "off"
-      },
-      "a11y": {
-        "useButtonType": "off",
-        "useSemanticElements": "off",
-        "useFocusableInteractive": "off",
-        "noStaticElementInteractions": "off",
-        "noSvgWithoutTitle": "off",
-        "useKeyWithClickEvents": "off",
-        "useAriaPropsForRole": "off",
-        "useValidAriaProps": "off",
-        "noLabelWithoutControl": "off",
-        "noAutofocus": "off"
-      },
-      "correctness": {
-        "useExhaustiveDependencies": "off"
-      },
-      "security": {
-        "noDangerouslySetInnerHtml": "off"
+        "noUnknownAtRules": "off"
       }
     },
     "domains": {
@@ -49,6 +30,13 @@
   "css": {
     "parser": {
       "tailwindDirectives": true
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
     }
   }
 }

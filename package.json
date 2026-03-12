@@ -1,12 +1,24 @@
 {
   "name": "ocpp-ws-simulator",
   "version": "1.0.2",
+  "description": "A browser-based OCPP 1.6 and 2.0.1 charge point simulator",
+  "author": "Rohit Tiwari <rohit.tiwari@example.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rohittiwari-dev/ocpp-ws-simulator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rohittiwari-dev/ocpp-ws-simulator/issues"
+  },
+  "homepage": "https://github.com/rohittiwari-dev/ocpp-ws-simulator#readme",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "biome check",
+    "format": "biome format --write"
   },
   "keywords": [
     "ocpp",
@@ -51,6 +63,7 @@
     "zustand": "^5.0.11"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.6",
     "@tailwindcss/postcss": "^4.2.1",
     "@types/node": "^25.3.3",
     "@types/react": "^19.2.14",

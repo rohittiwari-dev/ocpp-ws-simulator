@@ -499,13 +499,21 @@ const MEASURAND_OCPP_NAMES: Record<keyof MeasurandsConfig, string | null> = {
  * or simulation.measurands changes.
  */
 function syncDerivedKeys(
-  config: Pick<EmulatorConfig, "numberOfConnectors" | "simulation" | "stationConfig">,
+  config: Pick<
+    EmulatorConfig,
+    "numberOfConnectors" | "simulation" | "stationConfig"
+  >,
 ): StationConfigKey[] {
   const m = config.simulation?.measurands;
 
   // Build MeterValuesSampledData value from active measurands
   const sampledData = m
-    ? (Object.entries(MEASURAND_OCPP_NAMES) as [keyof MeasurandsConfig, string | null][])
+    ? (
+        Object.entries(MEASURAND_OCPP_NAMES) as [
+          keyof MeasurandsConfig,
+          string | null,
+        ][]
+      )
         .filter(([key, name]) => name !== null && m[key])
         .map(([, name]) => name as string)
         .join(",")
@@ -515,9 +523,7 @@ function syncDerivedKeys(
   const n = config.numberOfConnectors ?? 1;
   const phaseStr = m?.threePhase
     ? Array.from({ length: n }, (_, i) => `${i + 1}.NotApplicable`)
-        .flatMap((prefix) =>
-          ["L1", "L2", "L3"].map((ph) => `${prefix}`),
-        )
+        .flatMap((prefix) => ["L1", "L2", "L3"].map((ph) => `${prefix}`))
         .join(",")
     : Array.from({ length: n }, (_, i) => `${i + 1}.NotApplicable`).join(",");
 
@@ -555,7 +561,10 @@ const makeDefaultConfig = (index: number): EmulatorConfig => ({
   simulation: { ...DEFAULT_SIMULATION, measurands: { ...DEFAULT_MEASURANDS } },
   stationConfig: syncDerivedKeys({
     numberOfConnectors: 1,
-    simulation: { ...DEFAULT_SIMULATION, measurands: { ...DEFAULT_MEASURANDS } },
+    simulation: {
+      ...DEFAULT_SIMULATION,
+      measurands: { ...DEFAULT_MEASURANDS },
+    },
     stationConfig: DEFAULT_STATION_CONFIG.map((k) => ({ ...k })),
   }),
   rfidTag: "DEADBEEF",
