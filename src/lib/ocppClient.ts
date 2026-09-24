@@ -1,5 +1,9 @@
 import { nanoid } from "nanoid";
-import { BrowserOCPPClient, type HandlerContext } from "ocpp-ws-io/browser";
+import {
+	BrowserOCPPClient,
+	type HandlerContext,
+	type CallHandler,
+} from "ocpp-ws-io/browser";
 import {
 	type ChargingProfile,
 	type LocalAuthEntry,
@@ -38,8 +42,145 @@ class OCPPService {
 	private reservationTimers: Record<number, Timer> = {};
 	private autoChargeTimers: Record<number, Timer> = {};
 
+	// ─── Transaction session bookkeeping ──────────────────────────────────────
+	// The connector slice in the store is UI state and gets reset on disconnect,
+	// connector reset, profile switches and so on. The CSMS, however, keeps a
+	// transaction open until it sees StopTransaction. These two maps are the
+	// service-owned record of what is actually running, so a RemoteStop can
+	// always be matched back to a connector.
+
+	/** Lifecycle phase per connector. Guards against overlapping starts/stops. */
+	private txPhase: Record<number, "idle" | "starting" | "active" | "stopping"> =
+		{};
+	/** transactionId (stringified) -> connectorId. Survives connector resets. */
+	private txIndex = new Map<string, number>();
+	/** Stop requested while the transaction was still starting. */
+	private deferredStops = new Map<number, string>();
+
 	constructor(chargerId: string) {
 		this.chargerId = chargerId;
+	}
+
+	// ─── Transaction session helpers ──────────────────────────────────────────
+
+	private phaseOf(connectorId: number) {
+		return this.txPhase[connectorId] ?? "idle";
+	}
+
+	/**
+	 * Synchronously claim a connector for a new transaction. Returns false when
+	 * one is already starting, running or stopping there.
+	 *
+	 * This must stay synchronous: it is what makes two RemoteStartTransaction
+	 * requests arriving back to back resolve to a single transaction instead of
+	 * two, only one of which the simulator would remember.
+	 */
+	private claimForStart(connectorId: number): boolean {
+		if (this.phaseOf(connectorId) !== "idle") return false;
+		const conn = useEmulatorStore
+			.getState()
+			.chargers.find((c) => c.id === this.chargerId)?.runtime.connectors[
+			connectorId
+		];
+		if (conn?.inTransaction) return false;
+		this.txPhase[connectorId] = "starting";
+		return true;
+	}
+
+	private releaseConnector(connectorId: number) {
+		this.txPhase[connectorId] = "idle";
+	}
+
+	/** Record a live transaction so RemoteStop can find it later. */
+	private registerTransaction(connectorId: number, transactionId: unknown) {
+		this.txPhase[connectorId] = "active";
+		if (transactionId !== null && transactionId !== undefined) {
+			this.txIndex.set(String(transactionId), connectorId);
+		}
+	}
+
+	private forgetTransaction(connectorId: number, transactionId?: unknown) {
+		this.txPhase[connectorId] = "idle";
+		if (transactionId !== null && transactionId !== undefined) {
+			this.txIndex.delete(String(transactionId));
+			return;
+		}
+		for (const [key, id] of this.txIndex) {
+			if (id === connectorId) this.txIndex.delete(key);
+		}
+	}
+
+	/**
+	 * Map an incoming transactionId to a connector. Compares as strings so a
+	 * CSMS that sends "1234" for a transaction we stored as 1234 still matches,
+	 * and falls back to the store when the service map has been reset.
+	 */
+	private resolveTransaction(transactionId: unknown): number | null {
+		if (transactionId === null || transactionId === undefined) return null;
+		const key = String(transactionId);
+		const known = this.txIndex.get(key);
+		if (known !== undefined) return known;
+
+		const slot = useEmulatorStore
+			.getState()
+			.chargers.find((c) => c.id === this.chargerId);
+		if (!slot) return null;
+		for (const conn of Object.values(slot.runtime.connectors)) {
+			if (
+				conn?.transactionId !== null &&
+				conn?.transactionId !== undefined &&
+				String(conn.transactionId) === key
+			) {
+				return conn.connectorId;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Stable 2.x transaction id for an EVSE. Every TransactionEvent in one
+	 * session must carry the same id — generating a fresh one per event (the
+	 * old fallback) makes the CSMS see each event as a separate transaction.
+	 */
+	private transactionIdFor(evseId: number): string {
+		const conn = useEmulatorStore
+			.getState()
+			.chargers.find((c) => c.id === this.chargerId)?.runtime.connectors[
+			evseId
+		];
+		if (conn?.transactionId !== null && conn?.transactionId !== undefined) {
+			return String(conn.transactionId);
+		}
+		for (const [key, id] of this.txIndex) {
+			if (id === evseId) return key;
+		}
+		const generated = `TXN-${nanoid(6)}`;
+		this.txIndex.set(generated, evseId);
+		return generated;
+	}
+
+	/** Connectors this service believes are mid-transaction. */
+	private activeConnectorIds(): number[] {
+		const slot = useEmulatorStore
+			.getState()
+			.chargers.find((c) => c.id === this.chargerId);
+		const fromStore = Object.values(slot?.runtime.connectors ?? {})
+			.filter((c) => c?.inTransaction)
+			.map((c) => c.connectorId);
+		return [...new Set([...fromStore, ...this.txIndex.values()])];
+	}
+
+	/** Always clear before setting — an overwritten interval can never be stopped. */
+	private setMeterTimer(connectorId: number, timer: Timer) {
+		this.clearMeterTimer(connectorId);
+		this.meterTimers[connectorId] = timer;
+	}
+
+	private clearMeterTimer(connectorId: number) {
+		if (this.meterTimers[connectorId]) {
+			clearInterval(this.meterTimers[connectorId]);
+			delete this.meterTimers[connectorId];
+		}
 	}
 
 	// ─── Store helpers ────────────────────────────────────────────────────────
@@ -111,12 +252,19 @@ class OCPPService {
 						action: "Disconnected",
 						payload: { code: info.code, reason: info.reason },
 					});
+					// Connectors mid-transaction keep their session: the CSMS
+					// still has that transaction open and will expect to be
+					// able to stop it once we are back. Wiping it here is what
+					// makes a post-reconnect RemoteStop unmatchable.
 					const slot = s.chargers.find(
 						(c) => c.id === this.chargerId,
 					);
 					const n = slot?.config.numberOfConnectors ?? 1;
-					for (let i = 1; i <= n; i++)
+					for (let i = 1; i <= n; i++) {
+						if (slot?.runtime.connectors[i]?.inTransaction) continue;
 						s.resetConnector(this.chargerId, i);
+						this.releaseConnector(i);
+					}
 				},
 			);
 
@@ -249,8 +397,11 @@ class OCPPService {
 				payload,
 				ocppMessageId: ctx.messageId,
 			});
-			if (slot?.runtime.connectors[connId]?.inTransaction)
+			if (!slot?.runtime.connectors[connId])
 				return { status: "Rejected" };
+			// Claim synchronously: a duplicate or retried RemoteStart must not
+			// open a second transaction the simulator would then forget about.
+			if (!this.claimForStart(connId)) return { status: "Rejected" };
 			setTimeout(() => this.startTransaction(connId, payload.idTag), 500);
 			return { status: "Accepted" };
 		});
@@ -259,26 +410,21 @@ class OCPPService {
 		this.client.handle("RemoteStopTransaction", (ctx) => {
 			const payload = ctx.params as { transactionId: number };
 			const s = useEmulatorStore.getState();
-			const slot = s.chargers.find((c) => c.id === cid);
 			s.addLog(cid, {
 				direction: "Rx",
 				action: "RemoteStopTransaction",
 				payload,
 				ocppMessageId: ctx.messageId,
 			});
-			const n = slot?.config.numberOfConnectors ?? 1;
-			let connId: number | null = null;
-			for (let i = 1; i <= n; i++) {
-				if (
-					slot?.runtime.connectors[i]?.transactionId ===
-					payload.transactionId
-				) {
-					connId = i;
-					break;
-				}
+			const connId = this.resolveTransaction(payload.transactionId);
+			if (connId === null) return { status: "Rejected" };
+			if (this.phaseOf(connId) === "starting") {
+				// The transaction is mid-start; honour the stop once it lands
+				// rather than dropping it on the floor.
+				this.deferredStops.set(connId, "Remote");
+				return { status: "Accepted" };
 			}
-			if (!connId) return { status: "Rejected" };
-			setTimeout(() => this.stopTransaction(connId), 500);
+			setTimeout(() => this.stopTransaction(connId, "Remote"), 500);
 			return { status: "Accepted" };
 		});
 
@@ -1363,7 +1509,10 @@ class OCPPService {
 		});
 
 		// ── RemoteStartTransaction (2.x → use TransactionEvent) ──
-		this.client.handle("RemoteStartTransaction", (ctx) => {
+		// OCPP 2.0.1 renamed these to Request(Start|Stop)Transaction. Register
+		// the spec names, and keep the 1.6 names as aliases so a lenient or
+		// mislabelled CSMS still gets a response instead of NotImplemented.
+		const handleRequestStart: CallHandler = (ctx) => {
 			const payload = ctx.params as unknown as {
 				evseId?: number;
 				idToken: { idToken: string; type: string };
@@ -1373,48 +1522,43 @@ class OCPPService {
 			const evseId = payload.evseId ?? 1;
 			s.addLog(cid, {
 				direction: "Rx",
-				action: "RemoteStartTransaction",
+				action: ctx.method,
 				payload,
 				ocppMessageId: ctx.messageId,
 			});
-			if (slot?.runtime.connectors[evseId]?.inTransaction)
+			if (!slot?.runtime.connectors[evseId])
 				return { status: "Rejected" };
+			if (!this.claimForStart(evseId)) return { status: "Rejected" };
 			setTimeout(
 				() => this.startTransaction201(evseId, payload.idToken.idToken),
 				500,
 			);
 			return { status: "Accepted" };
-		});
+		};
+		this.client.handle("RequestStartTransaction", handleRequestStart);
+		this.client.handle("RemoteStartTransaction", handleRequestStart);
 
 		// ── RemoteStopTransaction (2.x) ──
-		this.client.handle("RemoteStopTransaction", (ctx) => {
+		const handleRequestStop: CallHandler = (ctx) => {
 			const payload = ctx.params as unknown as { transactionId: string };
 			const s = useEmulatorStore.getState();
-			const slot = s.chargers.find((c) => c.id === cid);
 			s.addLog(cid, {
 				direction: "Rx",
-				action: "RemoteStopTransaction",
+				action: ctx.method,
 				payload,
 				ocppMessageId: ctx.messageId,
 			});
-			const n = slot?.config.numberOfConnectors ?? 1;
-			let evseId: number | null = null;
-			for (let i = 1; i <= n; i++) {
-				if (
-					String(slot?.runtime.connectors[i]?.transactionId) ===
-					payload.transactionId
-				) {
-					evseId = i;
-					break;
-				}
+			const evseId = this.resolveTransaction(payload.transactionId);
+			if (evseId === null) return { status: "Rejected" };
+			if (this.phaseOf(evseId) === "starting") {
+				this.deferredStops.set(evseId, "Remote");
+				return { status: "Accepted" };
 			}
-			if (!evseId) return { status: "Rejected" };
-			setTimeout(
-				() => this.stopTransaction201(evseId as number, "Remote"),
-				500,
-			);
+			setTimeout(() => this.stopTransaction201(evseId, "Remote"), 500);
 			return { status: "Accepted" };
-		});
+		};
+		this.client.handle("RequestStopTransaction", handleRequestStop);
+		this.client.handle("RemoteStopTransaction", handleRequestStop);
 
 		// ── ClearCache ──
 		this.client.handle("ClearCache", (ctx) => {
@@ -1618,7 +1762,7 @@ class OCPPService {
 
 		// ── CostUpdated ──
 		this.client.handle("CostUpdated", (ctx) => {
-			const params = ctx.params as any;
+			const params = ctx.params;
 			useEmulatorStore.getState().addLog(cid, {
 				direction: "Rx",
 				action: "CostUpdated",
@@ -1635,7 +1779,7 @@ class OCPPService {
 
 		// ── DisplayMessage ──
 		this.client.handle("DisplayMessage", (ctx) => {
-			const params = ctx.params as any;
+			const params = ctx.params;
 			useEmulatorStore.getState().addLog(cid, {
 				direction: "Rx",
 				action: "DisplayMessage",
@@ -1654,7 +1798,7 @@ class OCPPService {
 
 		// ── ClearDisplayMessage ──
 		this.client.handle("ClearDisplayMessage", (ctx) => {
-			const params = ctx.params as any;
+			const params = ctx.params;
 			useEmulatorStore.getState().addLog(cid, {
 				direction: "Rx",
 				action: "ClearDisplayMessage",
@@ -1782,9 +1926,7 @@ class OCPPService {
 						? "Local"
 						: "ChargingRateChanged"),
 			transactionInfo: {
-				transactionId: String(
-					connector?.transactionId ?? `TXN-${nanoid(6)}`,
-				),
+				transactionId: this.transactionIdFor(evseId),
 				chargingState:
 					trigger === "Ended"
 						? "SuspendedEVSE"
@@ -1900,12 +2042,25 @@ class OCPPService {
 				payload: { message: String(err) },
 				ocppMessageId: msgId,
 			});
+			return { idTokenInfo: { status: "Invalid" } };
 		}
 	}
 
 	async startTransaction201(evseId: number, idTag: string) {
 		if (!this.client) return;
 		const { store } = getSlotState(this.chargerId);
+		const preClaimed = this.phaseOf(evseId) === "starting";
+		if (!preClaimed && !this.claimForStart(evseId)) {
+			store.addLog(this.chargerId, {
+				direction: "System",
+				action: "StartTransactionSkipped",
+				payload: {
+					evseId,
+					message: `EVSE busy (${this.phaseOf(evseId)})`,
+				},
+			});
+			return;
+		}
 		const txId = Date.now();
 		store.updateConnector(this.chargerId, evseId, {
 			inTransaction: true,
@@ -1915,55 +2070,49 @@ class OCPPService {
 				store.getSlot(this.chargerId)?.runtime.connectors[evseId]
 					?.currentMeterValue ?? 0,
 		});
+		this.registerTransaction(evseId, txId);
 		store.updateEVSE(this.chargerId, evseId, { status: "Occupied" });
 		this.sendStatusNotification201(evseId, 1, "Occupied");
 		await this.sendTransactionEvent("Started", evseId, "Authorized");
-		// Start meter timer
-		const cfgSlot = useEmulatorStore
-			.getState()
-			.chargers.find((c) => c.id === this.chargerId);
-		const meterInterval = parseInt(
-			cfgSlot?.config.stationConfig.find(
-				(k) => k.key === "MeterValueSampleInterval",
-			)?.value ?? "60",
-			10,
-		);
-		this.meterTimers[evseId] = setInterval(() => {
-			const s = useEmulatorStore.getState();
-			const cur = s.chargers.find((c) => c.id === this.chargerId)?.runtime
-				.connectors[evseId];
-			if (cur) {
-				s.updateConnector(this.chargerId, evseId, {
-					currentMeterValue:
-						cur.currentMeterValue +
-						(cfgSlot?.config.simulation.autoChargeMeterIncrement ??
-							250) /
-							(meterInterval / 10),
-				});
-			}
-			this.sendMeterValues(evseId);
-		}, meterInterval * 1000);
+		this.startMeterLoop(evseId);
+		const deferred = this.deferredStops.get(evseId);
+		if (deferred) {
+			this.deferredStops.delete(evseId);
+			await this.stopTransaction201(evseId, deferred);
+		}
 	}
 
 	async stopTransaction201(evseId: number, reason = "Local") {
 		if (!this.client) return;
 		const { store } = getSlotState(this.chargerId);
 		const snap = store.getSlot(this.chargerId)?.runtime.connectors[evseId];
+		if (!snap?.inTransaction) {
+			if (this.phaseOf(evseId) === "starting") {
+				this.deferredStops.set(evseId, reason);
+				return;
+			}
+			this.clearMeterTimer(evseId);
+			this.forgetTransaction(evseId);
+			return;
+		}
+		if (this.phaseOf(evseId) === "stopping") return;
+		this.txPhase[evseId] = "stopping";
+		// Stop metering before the closing event so the final meter value is
+		// the one reported in TransactionEvent(Ended).
+		this.clearMeterTimer(evseId);
+		const transactionId = snap.transactionId;
 		await this.sendTransactionEvent(
 			"Ended",
 			evseId,
 			reason,
-			snap?.currentMeterValue,
+			snap.currentMeterValue,
 		);
-		// Stop meter timer
-		if (this.meterTimers[evseId]) {
-			clearInterval(this.meterTimers[evseId]);
-			delete this.meterTimers[evseId];
-		}
 		store.updateConnector(this.chargerId, evseId, {
 			inTransaction: false,
 			transactionId: null,
+			startMeterValue: snap.currentMeterValue,
 		});
+		this.forgetTransaction(evseId, transactionId);
 		store.updateEVSE(this.chargerId, evseId, { status: "Available" });
 		this.sendStatusNotification201(evseId, 1, "Available");
 	}
@@ -2008,8 +2157,10 @@ class OCPPService {
 						.getState()
 						.chargers.find((c) => c.id === this.chargerId)?.config
 						.numberOfConnectors ?? 1;
+				const resumed = new Set(this.activeConnectorIds());
 				for (let i = 1; i <= n; i++)
-					this.sendStatusNotification(i, "Available");
+					if (!resumed.has(i)) this.sendStatusNotification(i, "Available");
+				this.resumeActiveTransactions();
 			}
 		} catch (err) {
 			store.addLog(this.chargerId, {
@@ -2018,6 +2169,34 @@ class OCPPService {
 				payload: { message: String(err) },
 				ocppMessageId: msgId,
 			});
+		}
+	}
+
+	/**
+	 * Re-announce and re-arm any transaction that was running before the socket
+	 * dropped. A charge point that reconnects mid-session is still charging, so
+	 * the CSMS must see Charging again and keep receiving meter values — and a
+	 * RemoteStop for that transaction has to keep working.
+	 */
+	private resumeActiveTransactions() {
+		const slot = useEmulatorStore
+			.getState()
+			.chargers.find((c) => c.id === this.chargerId);
+		if (!slot) return;
+		for (const conn of Object.values(slot.runtime.connectors)) {
+			if (!conn?.inTransaction) continue;
+			this.registerTransaction(conn.connectorId, conn.transactionId);
+			useEmulatorStore.getState().addLog(this.chargerId, {
+				direction: "System",
+				action: "TransactionResumed",
+				payload: {
+					connectorId: conn.connectorId,
+					transactionId: conn.transactionId,
+					meterValue: conn.currentMeterValue,
+				},
+			});
+			this.sendStatusNotification(conn.connectorId, "Charging");
+			this.startMeterLoop(conn.connectorId);
 		}
 	}
 
@@ -2138,6 +2317,21 @@ class OCPPService {
 		const { slot, store } = getSlotState(this.chargerId);
 		const connector = slot.runtime.connectors[connectorId];
 		if (!connector) return;
+		// Direct callers (UI button, scenario runner) have not claimed the
+		// connector yet; RemoteStartTransaction has. Either way exactly one
+		// start may be in flight per connector.
+		const preClaimed = this.phaseOf(connectorId) === "starting";
+		if (!preClaimed && !this.claimForStart(connectorId)) {
+			store.addLog(this.chargerId, {
+				direction: "System",
+				action: "StartTransactionSkipped",
+				payload: {
+					connectorId,
+					message: `Connector busy (${this.phaseOf(connectorId)})`,
+				},
+			});
+			return;
+		}
 		const tag = idTag ?? connector.idTag;
 		const authorized = await this.authorize(connectorId, tag);
 		if (!authorized) {
@@ -2147,18 +2341,25 @@ class OCPPService {
 				payload: { message: "Authorization rejected" },
 				ocppMessageId: nanoid(8),
 			});
+			this.releaseConnector(connectorId);
+			this.deferredStops.delete(connectorId);
+			await this.sendStatusNotification(connectorId, "Available");
 			return;
 		}
 		await this.sendStatusNotification(connectorId, "Preparing");
 		const freshSlot = useEmulatorStore
 			.getState()
 			?.chargers.find((c) => c.id === this.chargerId);
-		if (!freshSlot) return;
+		if (!freshSlot) {
+			this.releaseConnector(connectorId);
+			return;
+		}
 		const payload = {
 			connectorId,
 			idTag: tag,
-			meterStart:
+			meterStart: Math.round(
 				freshSlot.runtime.connectors[connectorId].startMeterValue,
+			),
 			timestamp: new Date().toISOString(),
 		};
 		const txMsgId = nanoid(8);
@@ -2187,36 +2388,20 @@ class OCPPService {
 					inTransaction: true,
 					transactionId: res.transactionId,
 					idTag: tag,
+					startMeterValue: payload.meterStart,
 				});
+				this.registerTransaction(connectorId, res.transactionId);
 				await this.sendStatusNotification(connectorId, "Charging");
-				const cfgSlot = useEmulatorStore
-					.getState()
-					?.chargers.find((c) => c.id === this.chargerId);
-				if (!cfgSlot) return;
-				const meterInterval = parseInt(
-					cfgSlot.config.stationConfig.find(
-						(k: StationConfigKey) =>
-							k.key === "MeterValueSampleInterval",
-					)?.value ?? "60",
-					10,
-				);
-				this.meterTimers[connectorId] = setInterval(() => {
-					const s = useEmulatorStore.getState();
-					const current = s.chargers.find(
-						(c) => c.id === this.chargerId,
-					)?.runtime.connectors[connectorId];
-					if (current) {
-						s.updateConnector(this.chargerId, connectorId, {
-							currentMeterValue:
-								current.currentMeterValue +
-								cfgSlot.config.simulation
-									.autoChargeMeterIncrement /
-									(meterInterval / 10),
-						});
-					}
-					this.sendMeterValues(connectorId);
-				}, meterInterval * 1000);
+				this.startMeterLoop(connectorId);
+				// A RemoteStop that arrived while we were still starting.
+				const deferred = this.deferredStops.get(connectorId);
+				if (deferred) {
+					this.deferredStops.delete(connectorId);
+					await this.stopTransaction(connectorId, deferred);
+				}
 			} else {
+				this.releaseConnector(connectorId);
+				this.deferredStops.delete(connectorId);
 				await this.sendStatusNotification(connectorId, "Available");
 			}
 		} catch (err) {
@@ -2226,7 +2411,54 @@ class OCPPService {
 				payload: { message: String(err) },
 				ocppMessageId: txMsgId,
 			});
+			// The call never completed, so no transaction exists on either
+			// side. Free the connector instead of wedging it in "Preparing".
+			this.releaseConnector(connectorId);
+			this.deferredStops.delete(connectorId);
+			await this.sendStatusNotification(connectorId, "Available");
 		}
+	}
+
+	/**
+	 * Drives the periodic meter tick + MeterValues for an active transaction.
+	 * Safe to call on resume: any previous interval is cleared first.
+	 */
+	private startMeterLoop(connectorId: number) {
+		const cfgSlot = useEmulatorStore
+			.getState()
+			?.chargers.find((c) => c.id === this.chargerId);
+		if (!cfgSlot) return;
+		const meterInterval = Math.max(
+			1,
+			parseInt(
+				cfgSlot.config.stationConfig.find(
+					(k: StationConfigKey) =>
+						k.key === "MeterValueSampleInterval",
+				)?.value ?? "60",
+				10,
+			) || 60,
+		);
+		const increment =
+			cfgSlot.config.simulation.autoChargeMeterIncrement /
+			Math.max(1, meterInterval / 10);
+
+		this.setMeterTimer(
+			connectorId,
+			setInterval(() => {
+				const s = useEmulatorStore.getState();
+				const current = s.chargers.find((c) => c.id === this.chargerId)
+					?.runtime.connectors[connectorId];
+				// The transaction ended by some other path — stop ticking.
+				if (!current?.inTransaction) {
+					this.clearMeterTimer(connectorId);
+					return;
+				}
+				s.updateConnector(this.chargerId, connectorId, {
+					currentMeterValue: current.currentMeterValue + increment,
+				});
+				this.sendMeterValues(connectorId);
+			}, meterInterval * 1000),
+		);
 	}
 
 	async sendMeterValues(connectorId: number) {
@@ -2341,24 +2573,44 @@ class OCPPService {
 		}
 	}
 
-	async stopTransaction(connectorId: number) {
+	async stopTransaction(connectorId: number, reason?: string) {
 		if (!this.client) return;
 		const s = useEmulatorStore.getState();
 		const slot = s.chargers?.find((c) => c.id === this.chargerId);
 		if (!slot) return;
 		const connector = slot.runtime.connectors[connectorId];
-		if (!connector?.inTransaction) return;
-		if (this.meterTimers[connectorId]) {
-			clearInterval(this.meterTimers[connectorId]);
-			delete this.meterTimers[connectorId];
+		if (!connector?.inTransaction) {
+			if (this.phaseOf(connectorId) === "starting") {
+				// A start is in flight. Queue the stop so the transaction is
+				// closed as soon as it exists instead of being orphaned.
+				this.deferredStops.set(connectorId, reason ?? "Local");
+				return;
+			}
+			// Nothing to stop; make sure no stale bookkeeping survives.
+			this.clearMeterTimer(connectorId);
+			this.forgetTransaction(connectorId);
+			return;
 		}
+		if (this.phaseOf(connectorId) === "stopping") return;
+		this.txPhase[connectorId] = "stopping";
+		this.clearMeterTimer(connectorId);
 		await this.sendStatusNotification(connectorId, "Finishing");
+
+		// Read the meter back after the status round-trip so the final value is
+		// the one the connector actually holds, not a pre-await snapshot.
+		const fresh =
+			useEmulatorStore
+				.getState()
+				.chargers.find((c) => c.id === this.chargerId)?.runtime
+				.connectors[connectorId] ?? connector;
+		const transactionId = fresh.transactionId ?? connector.transactionId;
+		const meterStop = Math.round(fresh.currentMeterValue);
 		const payload = {
-			transactionId: connector.transactionId,
-			idTag: connector.idTag,
-			meterStop: connector.currentMeterValue,
+			transactionId,
+			idTag: fresh.idTag,
+			meterStop,
 			timestamp: new Date().toISOString(),
-			reason: connector.stopReason,
+			reason: reason ?? fresh.stopReason,
 		};
 		const msgId = nanoid(8);
 		s.addLog(this.chargerId, {
@@ -2380,8 +2632,11 @@ class OCPPService {
 				.updateConnector(this.chargerId, connectorId, {
 					inTransaction: false,
 					transactionId: null,
-					startMeterValue: connector.currentMeterValue,
+					startMeterValue: fresh.currentMeterValue,
+					stopReason: (reason ??
+						fresh.stopReason) as typeof fresh.stopReason,
 				});
+			this.forgetTransaction(connectorId, transactionId);
 			await this.sendStatusNotification(connectorId, "Available");
 		} catch (err) {
 			s.addLog(this.chargerId, {
@@ -2390,6 +2645,12 @@ class OCPPService {
 				payload: { message: String(err) },
 				ocppMessageId: msgId,
 			});
+			// The CSMS never acknowledged the stop, so the transaction is still
+			// open on its side. Keep ours open too and go back to "active" so a
+			// retry can go through instead of leaving a connector that reports
+			// charging but can never be stopped.
+			this.txPhase[connectorId] = "active";
+			await this.sendStatusNotification(connectorId, "Charging");
 		}
 	}
 
@@ -2540,8 +2801,8 @@ class OCPPService {
 		});
 		try {
 			const res = await this.client.call(
-				"SecurityEventNotification" as any,
-				payload as any,
+				"SecurityEventNotification",
+				payload,
 			);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
@@ -2570,8 +2831,8 @@ class OCPPService {
 		});
 		try {
 			const res = await this.client.call(
-				"LogStatusNotification" as any,
-				payload as any,
+				"LogStatusNotification",
+				payload,
 			);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
@@ -2660,7 +2921,7 @@ class OCPPService {
 					useEmulatorStore
 						.getState()
 						.updateConnector(this.chargerId, connectorId, {
-							stopReason: "Local" as any,
+							stopReason: "Local",
 						});
 					this.stopTransaction(connectorId);
 					useEmulatorStore.getState().addLog(this.chargerId, {
@@ -2697,7 +2958,7 @@ class OCPPService {
 		const s = useEmulatorStore.getState();
 		s.addLog(this.chargerId, { direction: "Tx", action, payload });
 		try {
-			const res = await this.client.call(action as any, payload as any);
+			const res = await this.client.call(action, payload);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
 				action: `${action}Conf`,
@@ -2724,7 +2985,7 @@ class OCPPService {
 		});
 		try {
 			// Access the underlying WebSocket and send the raw string directly
-			(this.client as any).ws?.send?.(raw);
+			this.client.sendRaw(raw);
 		} catch (err) {
 			s.addLog(this.chargerId, {
 				direction: "Error",
@@ -2775,8 +3036,8 @@ class OCPPService {
 				});
 				try {
 					const res = await this.client.call(
-						"StatusNotification" as any,
-						payload as any,
+						"StatusNotification",
+						payload,
 					);
 					s.addLog(this.chargerId, {
 						direction: "Rx",
@@ -2851,9 +3112,10 @@ class OCPPService {
 						if (is2x) {
 							const res2 = (await this.sendAuthorize201(
 								String(p.idTag),
-							)) as any;
+							)) as { idTokenInfo?: { status: string } };
 							authOk =
-								res2 && res2.idTokenInfo?.status === "Accepted";
+								res2 &&
+								res2?.idTokenInfo?.status === "Accepted";
 						} else {
 							authOk = await this.authorize(cid, String(p.idTag));
 						}
@@ -2926,7 +3188,10 @@ class OCPPService {
 						// just a delay, handled above
 						break;
 				}
-			} catch (err: any) {
+			} catch (error) {
+				const err = Error.isError(error)
+					? error
+					: new Error(String(error));
 				console.warn(
 					`[Scenario] Step ${i} (${step.action}) failed:`,
 					err,
