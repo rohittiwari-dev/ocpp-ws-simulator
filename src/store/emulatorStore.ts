@@ -553,7 +553,7 @@ const DEFAULT_SIMULATION: SimulationConfig = {
 
 const makeDefaultConfig = (index: number): EmulatorConfig => ({
   endpoint: "ws://localhost:9000",
-  chargePointId: `CP-00${index}`,
+  chargePointId: chargePointIdForIndex(index),
   ocppVersion: "ocpp1.6",
   securityProfile: 0,
   basicAuthPassword: "",
@@ -765,6 +765,28 @@ const makeDefaultRuntime = (rfidTag: string): ChargerRuntimeState => ({
   transactionSeq: 0,
 });
 
+/**
+ * Lowest index not already taken by an existing charge point id or label.
+ *
+ * Deriving this from `chargers.length` collides as soon as a charger other
+ * than the last one is removed, and two slots sharing a chargePointId means two
+ * OCPP identities colliding on the CSMS.
+ */
+const nextFreeChargerIndex = (chargers: ChargerSlot[]): number => {
+  const taken = new Set<string>();
+  for (const c of chargers) {
+    taken.add(c.config.chargePointId);
+    taken.add(c.label);
+  }
+  for (let i = 1; ; i++) {
+    if (!taken.has(chargePointIdForIndex(i)) && !taken.has(`Charger ${i}`))
+      return i;
+  }
+};
+
+const chargePointIdForIndex = (index: number) =>
+  `CP-${String(index).padStart(3, "0")}`;
+
 export const makeDefaultSlot = (index: number): ChargerSlot => {
   const cfg = makeDefaultConfig(index);
   return {
@@ -806,7 +828,7 @@ export const useEmulatorStore = create<EmulatorStore>()(
 
       addCharger: () =>
         set((s) => {
-          const next = makeDefaultSlot(s.chargers.length + 1);
+          const next = makeDefaultSlot(nextFreeChargerIndex(s.chargers));
           return { chargers: [...s.chargers, next], activeChargerId: next.id };
         }),
 
@@ -825,10 +847,21 @@ export const useEmulatorStore = create<EmulatorStore>()(
         set((s) => {
           const src = s.chargers.find((c) => c.id === id);
           if (!src) return s;
+          // A copy must not inherit the source chargePointId: two slots
+          // presenting the same OCPP identity collide on the CSMS, which
+          // typically drops one of the two connections.
+          const index = nextFreeChargerIndex(s.chargers);
+          const clonedConfig: EmulatorConfig = JSON.parse(
+            JSON.stringify(src.config),
+          );
           const dup: ChargerSlot = {
-            ...JSON.parse(JSON.stringify(src)),
             id: nanoid(8),
             label: `${src.label} (copy)`,
+            config: {
+              ...clonedConfig,
+              chargePointId: chargePointIdForIndex(index),
+            },
+            savedProfiles: JSON.parse(JSON.stringify(src.savedProfiles)),
             runtime: makeDefaultRuntime(src.config.rfidTag),
           };
           return {

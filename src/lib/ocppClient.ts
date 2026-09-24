@@ -41,6 +41,8 @@ class OCPPService {
 	private uploadTimer: Timer | null = null;
 	private reservationTimers: Record<number, Timer> = {};
 	private autoChargeTimers: Record<number, Timer> = {};
+	/** Pending steps of the simulated firmware lifecycle. */
+	private firmwareTimers: Timer[] = [];
 
 	// ─── Transaction session bookkeeping ──────────────────────────────────────
 	// The connector slice in the store is UI state and gets reset on disconnect,
@@ -174,6 +176,13 @@ class OCPPService {
 	private setMeterTimer(connectorId: number, timer: Timer) {
 		this.clearMeterTimer(connectorId);
 		this.meterTimers[connectorId] = timer;
+	}
+
+	private clearReservationTimer(connectorId: number) {
+		if (this.reservationTimers[connectorId]) {
+			clearTimeout(this.reservationTimers[connectorId]);
+			delete this.reservationTimers[connectorId];
+		}
 	}
 
 	private clearMeterTimer(connectorId: number) {
@@ -316,6 +325,8 @@ class OCPPService {
 		if (this.uploadTimer) clearInterval(this.uploadTimer);
 		Object.values(this.reservationTimers).forEach(clearTimeout);
 		Object.values(this.autoChargeTimers).forEach(clearInterval);
+		this.firmwareTimers.forEach(clearTimeout);
+		this.firmwareTimers = [];
 		this.heartbeatTimer = null;
 		this.meterTimers = {};
 		this.uploadTimer = null;
@@ -545,21 +556,6 @@ class OCPPService {
 			return { status: "Accepted" };
 		});
 
-		// ── UnlockConnector ──
-		this.client.handle("UnlockConnector", (ctx) => {
-			const payload = ctx.params as { connectorId: number };
-			const s = useEmulatorStore.getState();
-			const slot = s.chargers.find((c) => c.id === cid);
-			s.addLog(cid, {
-				direction: "Rx",
-				action: "UnlockConnector",
-				payload,
-				ocppMessageId: ctx.messageId,
-			});
-			const connector = slot?.runtime.connectors[payload.connectorId];
-			return { status: connector?.unlockStatus ?? "UnlockFailed" };
-		});
-
 		// ── GetDiagnostics ──
 		this.client.handle("GetDiagnostics", (ctx) => {
 			const s = useEmulatorStore.getState();
@@ -575,21 +571,6 @@ class OCPPService {
 			});
 			this.startDiagnosticsUpload();
 			return { fileName: slot.config.simulation.diagnosticFileName };
-		});
-
-		// ── UpdateFirmware ──
-		this.client.handle("UpdateFirmware", (ctx) => {
-			useEmulatorStore.getState().addLog(cid, {
-				direction: "Rx",
-				action: "UpdateFirmware",
-				payload: ctx.params,
-				ocppMessageId: ctx.messageId,
-			});
-			setTimeout(() => this.sendFirmwareStatus("Downloading"), 1000);
-			setTimeout(() => this.sendFirmwareStatus("Downloaded"), 3000);
-			setTimeout(() => this.sendFirmwareStatus("Installing"), 5000);
-			setTimeout(() => this.sendFirmwareStatus("Installed"), 7000);
-			return {};
 		});
 
 		// ── ClearCache ──
@@ -663,6 +644,14 @@ class OCPPService {
 			if (conn.inTransaction) return { status: "Occupied" };
 			if (conn.status === "Faulted") return { status: "Faulted" };
 			if (conn.status === "Unavailable") return { status: "Unavailable" };
+			// Already held by a different reservation.
+			if (
+				conn.reservation &&
+				conn.reservation.reservationId !== payload.reservationId
+			)
+				return { status: "Occupied" };
+			// Re-reserving the same connector replaces the pending expiry.
+			this.clearReservationTimer(payload.connectorId);
 			s.updateConnector(cid, payload.connectorId, {
 				status: "Reserved",
 				reservation: {
@@ -682,10 +671,23 @@ class OCPPService {
 						.chargers.find((c) => c.id === cid)?.runtime.connectors[
 						payload.connectorId
 					];
+					delete this.reservationTimers[payload.connectorId];
 					if (
-						current?.reservation?.reservationId ===
+						current?.reservation?.reservationId !==
 						payload.reservationId
-					) {
+					)
+						return;
+					if (current.inTransaction) {
+						// Charging started under this reservation: drop the
+						// reservation but never announce Available mid-session.
+						useEmulatorStore
+							.getState()
+							.updateConnector(cid, payload.connectorId, {
+								reservation: null,
+							});
+						return;
+					}
+					{
 						useEmulatorStore
 							.getState()
 							.updateConnector(cid, payload.connectorId, {
@@ -731,10 +733,7 @@ class OCPPService {
 						status: "Available",
 						reservation: null,
 					});
-					if (this.reservationTimers[i]) {
-						clearTimeout(this.reservationTimers[i]);
-						delete this.reservationTimers[i];
-					}
+					this.clearReservationTimer(i);
 					this.sendStatusNotification(i, "Available");
 					return { status: "Accepted" };
 				}
@@ -801,6 +800,7 @@ class OCPPService {
 			});
 			let found = false;
 			for (let i = 1; i <= slot.config.numberOfConnectors; i++) {
+				// connectorId absent or 0 means "every connector".
 				if (
 					payload.connectorId !== undefined &&
 					payload.connectorId !== i &&
@@ -809,24 +809,19 @@ class OCPPService {
 					continue;
 				const profiles =
 					slot.runtime.connectors[i]?.chargingProfiles ?? [];
+				// A profile is cleared when it matches ALL supplied criteria;
+				// an omitted criterion is a wildcard, so a request carrying no
+				// criteria at all clears every profile on the connector.
 				const filtered = profiles.filter((p) => {
-					if (
-						payload.id !== undefined &&
-						p.chargingProfileId === payload.id
-					)
-						return false;
-					if (
-						payload.chargingProfilePurpose &&
-						p.chargingProfilePurpose ===
-							payload.chargingProfilePurpose
-					)
-						return false;
-					if (
-						payload.stackLevel !== undefined &&
-						p.stackLevel === payload.stackLevel
-					)
-						return false;
-					return true;
+					const matches =
+						(payload.id === undefined ||
+							p.chargingProfileId === payload.id) &&
+						(!payload.chargingProfilePurpose ||
+							p.chargingProfilePurpose ===
+								payload.chargingProfilePurpose) &&
+						(payload.stackLevel === undefined ||
+							p.stackLevel === payload.stackLevel);
+					return !matches;
 				});
 				if (filtered.length !== profiles.length) {
 					found = true;
@@ -1016,10 +1011,12 @@ class OCPPService {
 				payload: ctx.params,
 				ocppMessageId: ctx.messageId,
 			});
-			this.sendFirmwareStatus("Downloading");
-			setTimeout(() => this.sendFirmwareStatus("Downloaded"), 3000);
-			setTimeout(() => this.sendFirmwareStatus("Installing"), 6000);
-			setTimeout(() => this.sendFirmwareStatus("Installed"), 9000);
+			this.runFirmwareSequence([
+				{ status: "Downloading", delay: 0 },
+				{ status: "Downloaded", delay: 3000 },
+				{ status: "Installing", delay: 3000 },
+				{ status: "Installed", delay: 3000 },
+			]);
 			return { status: "Accepted" };
 		});
 
@@ -1082,190 +1079,31 @@ class OCPPService {
 			const conn = slot?.runtime.connectors[connId];
 			if (!conn) return { status: "NotSupported" };
 
+			// The connector's configured unlockStatus is the simulation lever
+			// for an unlock that fails on real hardware (jammed cable, etc.).
+			if (conn.unlockStatus === "UnlockFailed") {
+				return { status: "UnlockFailed" };
+			}
+
 			// Unlock the cable
 			s.updateConnector(cid, connId, {
 				cableLocked: false,
 				cablePluggedIn: false,
-				unlockStatus: "Unlocked",
 			});
 
-			// If there's a transaction, stop it with EVDisconnected
 			if (conn.inTransaction) {
+				// stopTransaction drives Finishing -> StopTransaction ->
+				// Available itself; emitting Available here as well would put
+				// the status sequence out of order on the CSMS.
 				s.updateConnector(cid, connId, {
 					stopReason: "EVDisconnected",
 				});
-				this.stopTransaction(connId);
+				this.stopTransaction(connId, "EVDisconnected");
+			} else {
+				this.sendStatusNotification(connId, "Available");
 			}
-
-			// Send status Available
-			this.sendStatusNotification(connId, "Available");
 
 			return { status: "Unlocked" };
-		});
-
-		// ── SetChargingProfile ──
-		this.client.handle("SetChargingProfile", (ctx) => {
-			const payload = ctx.params as {
-				connectorId: number;
-				csChargingProfiles: ChargingProfile;
-			};
-			const s = useEmulatorStore.getState();
-			s.addLog(cid, {
-				direction: "Rx",
-				action: "SetChargingProfile",
-				payload,
-				ocppMessageId: ctx.messageId,
-			});
-			const connId = payload.connectorId ?? 1;
-			const slot = s.chargers.find((c) => c.id === cid);
-			const existing =
-				slot?.runtime.connectors[connId]?.chargingProfiles ?? [];
-			// Replace profile with same ID or append
-			const filtered = existing.filter(
-				(p) =>
-					p.chargingProfileId !==
-					payload.csChargingProfiles.chargingProfileId,
-			);
-			filtered.push(payload.csChargingProfiles);
-			s.updateConnector(cid, connId, { chargingProfiles: filtered });
-			return { status: "Accepted" };
-		});
-
-		// ── ClearChargingProfile ──
-		this.client.handle("ClearChargingProfile", (ctx) => {
-			const payload = ctx.params as {
-				id?: number;
-				connectorId?: number;
-				chargingProfilePurpose?: string;
-				stackLevel?: number;
-			};
-			const s = useEmulatorStore.getState();
-			s.addLog(cid, {
-				direction: "Rx",
-				action: "ClearChargingProfile",
-				payload,
-				ocppMessageId: ctx.messageId,
-			});
-			const slot = s.chargers.find((c) => c.id === cid);
-			if (!slot) return { status: "Unknown" };
-			let found = false;
-			for (const [connIdStr, conn] of Object.entries(
-				slot.runtime.connectors,
-			)) {
-				const connId = Number(connIdStr);
-				if (
-					payload.connectorId != null &&
-					payload.connectorId !== connId
-				)
-					continue;
-				const before = conn.chargingProfiles.length;
-				const after = conn.chargingProfiles.filter((p) => {
-					if (
-						payload.id != null &&
-						p.chargingProfileId === payload.id
-					)
-						return false;
-					if (
-						payload.chargingProfilePurpose &&
-						p.chargingProfilePurpose ===
-							payload.chargingProfilePurpose
-					)
-						return false;
-					if (
-						payload.stackLevel != null &&
-						p.stackLevel === payload.stackLevel
-					)
-						return false;
-					return true;
-				});
-				if (after.length !== before) {
-					s.updateConnector(cid, connId, { chargingProfiles: after });
-					found = true;
-				}
-			}
-			return { status: found ? "Accepted" : "Unknown" };
-		});
-
-		// ── ReserveNow ──
-		this.client.handle("ReserveNow", (ctx) => {
-			const payload = ctx.params as {
-				connectorId: number;
-				expiryDate: string;
-				idTag: string;
-				parentIdTag?: string;
-				reservationId: number;
-			};
-			const s = useEmulatorStore.getState();
-			s.addLog(cid, {
-				direction: "Rx",
-				action: "ReserveNow",
-				payload,
-				ocppMessageId: ctx.messageId,
-			});
-			const slot = s.chargers.find((c) => c.id === cid);
-			const conn = slot?.runtime.connectors[payload.connectorId];
-			if (!conn) return { status: "Rejected" };
-			if (conn.inTransaction) return { status: "Occupied" };
-			if (conn.reservation) return { status: "Rejected" };
-			s.updateConnector(cid, payload.connectorId, {
-				status: "Reserved",
-				reservation: {
-					reservationId: payload.reservationId,
-					idTag: payload.idTag,
-					expiryDate: payload.expiryDate,
-					parentIdTag: payload.parentIdTag,
-				},
-			});
-			// Auto-expire
-			const expiresIn =
-				new Date(payload.expiryDate).getTime() - Date.now();
-			if (expiresIn > 0) {
-				setTimeout(() => {
-					const cur = useEmulatorStore.getState();
-					const sl = cur.chargers.find((c) => c.id === cid);
-					const cn = sl?.runtime.connectors[payload.connectorId];
-					if (
-						cn?.reservation?.reservationId === payload.reservationId
-					) {
-						cur.updateConnector(cid, payload.connectorId, {
-							status: "Available",
-							reservation: null,
-						});
-						cur.addLog(cid, {
-							direction: "System",
-							action: "ReservationExpired",
-							payload: { reservationId: payload.reservationId },
-						});
-					}
-				}, expiresIn);
-			}
-			return { status: "Accepted" };
-		});
-
-		// ── CancelReservation ──
-		this.client.handle("CancelReservation", (ctx) => {
-			const payload = ctx.params as { reservationId: number };
-			const s = useEmulatorStore.getState();
-			s.addLog(cid, {
-				direction: "Rx",
-				action: "CancelReservation",
-				payload,
-				ocppMessageId: ctx.messageId,
-			});
-			const slot = s.chargers.find((c) => c.id === cid);
-			if (!slot) return { status: "Rejected" };
-			for (const [connIdStr, conn] of Object.entries(
-				slot.runtime.connectors,
-			)) {
-				if (conn.reservation?.reservationId === payload.reservationId) {
-					s.updateConnector(cid, Number(connIdStr), {
-						status: "Available",
-						reservation: null,
-					});
-					return { status: "Accepted" };
-				}
-			}
-			return { status: "Rejected" };
 		});
 
 		// ── UpdateFirmware ──
@@ -1283,20 +1121,33 @@ class OCPPService {
 				payload,
 				ocppMessageId: ctx.messageId,
 			});
-			// Simulate the firmware update lifecycle
-			const steps = [
-				{ status: "Downloading", delay: 2000 },
-				{ status: "Downloaded", delay: 3000 },
-				{ status: "Installing", delay: 3000 },
-				{ status: "Installed", delay: 2000 },
-			];
-			let cumulative = 0;
-			for (const step of steps) {
-				cumulative += step.delay;
-				setTimeout(() => {
-					this.sendFirmwareStatus(step.status);
-				}, cumulative);
+			// retrieveDate is when the charge point should START retrieving the
+			// firmware — a CSMS scheduling an update for later expects nothing
+			// to happen until then.
+			const retrieveAt = Date.parse(payload.retrieveDate);
+			const startDelay = Number.isNaN(retrieveAt)
+				? 0
+				: Math.max(0, retrieveAt - Date.now());
+			if (startDelay > 0) {
+				s.addLog(cid, {
+					direction: "System",
+					action: "FirmwareUpdateScheduled",
+					payload: {
+						location: payload.location,
+						retrieveDate: payload.retrieveDate,
+						startsInSeconds: Math.round(startDelay / 1000),
+					},
+				});
 			}
+			this.runFirmwareSequence(
+				[
+					{ status: "Downloading", delay: 2000 },
+					{ status: "Downloaded", delay: 3000 },
+					{ status: "Installing", delay: 3000 },
+					{ status: "Installed", delay: 2000 },
+				],
+				startDelay,
+			);
 			return {};
 		});
 	}
@@ -2313,7 +2164,13 @@ class OCPPService {
 	}
 
 	async startTransaction(connectorId: number, idTag?: string) {
-		if (!this.client) return;
+		if (!this.client) {
+			// Claimed by RemoteStartTransaction, then the socket went away
+			// before the delayed start fired — do not strand the connector.
+			this.releaseConnector(connectorId);
+			this.deferredStops.delete(connectorId);
+			return;
+		}
 		const { slot, store } = getSlotState(this.chargerId);
 		const connector = slot.runtime.connectors[connectorId];
 		if (!connector) return;
@@ -2389,7 +2246,10 @@ class OCPPService {
 					transactionId: res.transactionId,
 					idTag: tag,
 					startMeterValue: payload.meterStart,
+					// Charging consumes any reservation held on this connector.
+					reservation: null,
 				});
+				this.clearReservationTimer(connectorId);
 				this.registerTransaction(connectorId, res.transactionId);
 				await this.sendStatusNotification(connectorId, "Charging");
 				this.startMeterLoop(connectorId);
@@ -2677,6 +2537,39 @@ class OCPPService {
 				ocppMessageId: msgId,
 			});
 		} catch (_) {}
+	}
+
+	/**
+	 * Runs the simulated firmware lifecycle.
+	 *
+	 * Steps are tracked so the sequence can be cancelled: a disconnect clears
+	 * them (otherwise stale steps surface on the next session), and a second
+	 * UpdateFirmware replaces the first instead of interleaving with it.
+	 */
+	private runFirmwareSequence(
+		steps: { status: string; delay: number }[],
+		startDelayMs = 0,
+	) {
+		this.cancelFirmwareSequence();
+		let cumulative = startDelayMs;
+		for (const step of steps) {
+			cumulative += step.delay;
+			this.firmwareTimers.push(
+				setTimeout(() => {
+					useEmulatorStore
+						.getState()
+						.updateSimulation(this.chargerId, {
+							firmwareStatus: step.status,
+						});
+					this.sendFirmwareStatus(step.status);
+				}, cumulative),
+			);
+		}
+	}
+
+	private cancelFirmwareSequence() {
+		this.firmwareTimers.forEach(clearTimeout);
+		this.firmwareTimers = [];
 	}
 
 	async sendFirmwareStatus(status: string) {

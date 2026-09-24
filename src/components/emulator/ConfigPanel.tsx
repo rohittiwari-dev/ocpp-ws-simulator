@@ -604,7 +604,7 @@ const BOOT_FIELDS: {
 ];
 
 function VendorTab() {
-  const { status, config, updateBootNotification, updateVendorConfig } =
+  const { id, status, config, updateBootNotification, updateVendorConfig } =
     useActiveCharger();
   const locked = status === "connected" || status === "connecting";
   const boot = config.bootNotification;
@@ -670,7 +670,8 @@ function VendorTab() {
           <Button
             onClick={() => {
               import("@/lib/ocppClient").then((m) =>
-                m.getService(config.chargePointId).sendDataTransfer(),
+                // getService is keyed by the slot id, not the OCPP identity.
+                m.getService(id).sendDataTransfer(),
               );
             }}
             disabled={!vendor?.vendorId || locked !== true}

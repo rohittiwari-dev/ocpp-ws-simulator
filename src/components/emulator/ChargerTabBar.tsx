@@ -1,6 +1,7 @@
 "use client";
 
 import { Copy, Loader2, Plus, Wifi, WifiOff, X } from "lucide-react";
+import { removeService } from "@/lib/ocppClient";
 import { useEmulatorStore } from "@/store/emulatorStore";
 
 /* ─── helpers ─────────────────────────────────────────────────── */
@@ -84,6 +85,10 @@ export function ChargerTabBar() {
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
+                    // Drop the socket and timers before the slot disappears —
+                    // otherwise the charge point stays connected to the CSMS
+                    // with no tab left to disconnect it.
+                    removeService(slot.id);
                     removeCharger(slot.id);
                   }}
                   title="Remove charger"
