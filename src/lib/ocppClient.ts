@@ -43,6 +43,11 @@ class OCPPService {
 	private autoChargeTimers: Record<number, Timer> = {};
 	/** Pending steps of the simulated firmware lifecycle. */
 	private firmwareTimers: Timer[] = [];
+	/** Pending reboot steps from a Hard Reset. */
+	private resetTimers: Timer[] = [];
+	private rebooting = false;
+	/** Locally assigned ids for transactions started while offline. */
+	private nextOfflineTransactionId = -1;
 
 	// ─── Transaction session bookkeeping ──────────────────────────────────────
 	// The connector slice in the store is UI state and gets reset on disconnect,
@@ -296,6 +301,7 @@ class OCPPService {
 				},
 			);
 
+			this.installResponseDelay();
 			this.registerHandlers();
 			await this.client.connect();
 		} catch (err: unknown) {
@@ -310,13 +316,43 @@ class OCPPService {
 		}
 	}
 
-	async disconnect() {
+	/**
+	 * @param internal true when called as part of a simulated reboot, which
+	 * must not cancel the reboot it is a step of.
+	 */
+	async disconnect(internal = false) {
+		if (!internal) this.cancelReboot();
 		try {
 			await this.client?.close({ code: 1000, reason: "User disconnect" });
 		} catch (_) {}
 		this.client = null;
 		this.clearAllTimers();
 		useEmulatorStore.getState().setStatus(this.chargerId, "disconnected");
+	}
+
+	/** Hard Reset: drop the connection, then come back up like a real reboot. */
+	private scheduleReboot() {
+		this.cancelReboot();
+		this.rebooting = true;
+		this.resetTimers.push(
+			setTimeout(async () => {
+				await this.disconnect(true);
+				if (!this.rebooting) return;
+				this.resetTimers.push(
+					setTimeout(() => {
+						this.rebooting = false;
+						this.connect();
+					}, 1500),
+				);
+			}, 300),
+		);
+	}
+
+	/** A manual disconnect cancels a pending reboot instead of racing it. */
+	private cancelReboot() {
+		this.rebooting = false;
+		this.resetTimers.forEach(clearTimeout);
+		this.resetTimers = [];
 	}
 
 	private clearAllTimers() {
@@ -337,24 +373,141 @@ class OCPPService {
 	// ─── Incoming CSMS Handlers ───────────────────────────────────────────────
 
 	/**
-	 * Wraps handler registration with configurable response delay.
-	 * If responseDelayMs > 0, the handler response is held for that duration.
+	 * Single exit point for outgoing OCPP calls.
+	 *
+	 * In simulated offline mode nothing reaches the socket: the message is
+	 * appended to the offline queue and answered locally, so the charge point
+	 * keeps charging and metering exactly as a real one does when it loses its
+	 * backend. The queue is replayed in order when the station comes back.
 	 */
-
-	// biome-ignore lint/correctness/noUnusedPrivateClassMembers: may be we require later
-	private handleWithDelay(
+	private async sendCall<T = unknown>(
 		action: string,
-		handler: (ctx: HandlerContext) => unknown,
-	) {
-		if (!this.client) return;
-		this.client.handle(action, async (ctx: HandlerContext) => {
-			const { config } = getSlotState(this.chargerId);
-			const delay = config.simulation.responseDelayMs;
-			const result = handler(ctx);
-			if (delay > 0) {
-				await new Promise((r) => setTimeout(r, delay));
+		params: unknown,
+	): Promise<T> {
+		if (!this.client) throw new Error("Not connected");
+		const s = useEmulatorStore.getState();
+		if (s.getSlot(this.chargerId)?.runtime.offlineMode) {
+			s.addToOfflineQueue(this.chargerId, {
+				action,
+				payload: params,
+				timestamp: new Date().toISOString(),
+			});
+			s.addLog(this.chargerId, {
+				direction: "System",
+				action: "OfflineQueued",
+				payload: {
+					queuedAction: action,
+					depth:
+						(s.getSlot(this.chargerId)?.runtime.offlineQueue
+							.length ?? 0) + 1,
+				},
+			});
+			return this.offlineResponse<T>(action);
+		}
+		return (await this.client.call(
+			action,
+			params as Record<string, unknown>,
+		)) as T;
+	}
+
+	/**
+	 * What the charge point assumes while it cannot reach the CSMS. Offline
+	 * transactions get a locally assigned negative id, which is the usual
+	 * convention for "the CSMS has not numbered this yet".
+	 */
+	private offlineResponse<T>(action: string): T {
+		switch (action) {
+			case "Authorize":
+				return {
+					idTagInfo: { status: "Accepted" },
+					idTokenInfo: { status: "Accepted" },
+				} as T;
+			case "StartTransaction":
+				return {
+					transactionId: this.nextOfflineTransactionId--,
+					idTagInfo: { status: "Accepted" },
+				} as T;
+			case "BootNotification":
+				return { status: "Accepted", interval: 300 } as T;
+			default:
+				return {} as T;
+		}
+	}
+
+	/** Replays everything captured while offline, oldest first. */
+	private async flushOfflineQueue() {
+		const s = useEmulatorStore.getState();
+		const queued = s.getSlot(this.chargerId)?.runtime.offlineQueue ?? [];
+		if (queued.length === 0) return;
+		s.clearOfflineQueue(this.chargerId);
+		s.addLog(this.chargerId, {
+			direction: "System",
+			action: "OfflineReplay",
+			payload: { count: queued.length },
+		});
+		for (const entry of queued) {
+			if (!this.client) break;
+			try {
+				await this.client.call(
+					entry.action,
+					entry.payload as Record<string, unknown>,
+				);
+			} catch (err) {
+				useEmulatorStore.getState().addLog(this.chargerId, {
+					direction: "Error",
+					action: "OfflineReplay",
+					payload: {
+						queuedAction: entry.action,
+						message: String(err),
+					},
+				});
 			}
-			return result;
+		}
+	}
+
+	/**
+	 * Toggle simulated offline mode. Going back online replays the queue, so
+	 * the CSMS receives the session it missed.
+	 */
+	async setOfflineMode(offline: boolean) {
+		const s = useEmulatorStore.getState();
+		const current = s.getSlot(this.chargerId)?.runtime.offlineMode ?? false;
+		if (current === offline) return;
+		s.toggleOfflineMode(this.chargerId);
+		s.addLog(this.chargerId, {
+			direction: "System",
+			action: offline ? "WentOffline" : "WentOnline",
+			payload: {},
+		});
+		if (!offline) await this.flushOfflineQueue();
+	}
+
+	/**
+	 * Holds every outgoing response back by the configured delay.
+	 *
+	 * Registered as middleware rather than wrapped around each handler so the
+	 * library keeps applying its per-message request/response types. The charge
+	 * point still acts on the request immediately — only the reply is late,
+	 * which is what a slow station looks like to a CSMS and is how you provoke
+	 * its call timeout.
+	 */
+	private installResponseDelay() {
+		if (!this.client) return;
+		this.client.use(async (ctx, next) => {
+			// The middleware wraps dispatch *and* the reply, so the wait has to
+			// happen before next() — delaying afterwards would run once the
+			// CALLRESULT had already gone out.
+			if (ctx.type === "incoming_call") {
+				const delay =
+					useEmulatorStore
+						.getState()
+						.getSlot(this.chargerId)?.config.simulation
+						.responseDelayMs ?? 0;
+				if (delay > 0) {
+					await new Promise((r) => setTimeout(r, delay));
+				}
+			}
+			return next();
 		});
 	}
 
@@ -385,10 +538,7 @@ class OCPPService {
 				ocppMessageId: ctx.messageId,
 			});
 			if (payload.type === "Hard") {
-				setTimeout(() => {
-					this.disconnect();
-					setTimeout(() => this.connect(), 1500);
-				}, 300);
+				this.scheduleReboot();
 			}
 			return { status: "Accepted" };
 		});
@@ -550,6 +700,16 @@ class OCPPService {
 				const interval = Number(payload.value);
 				if (!Number.isNaN(interval) && interval > 0) {
 					this.startHeartbeatTimer(interval);
+				}
+			}
+			if (payload.key === "MeterValueSampleInterval") {
+				// Re-arm any running meter loop so the new sample rate takes
+				// effect on the current transaction, not just the next one.
+				const interval = Number(payload.value);
+				if (!Number.isNaN(interval) && interval > 0) {
+					for (const connId of this.activeConnectorIds()) {
+						this.startMeterLoop(connId);
+					}
 				}
 			}
 
@@ -1613,7 +1773,7 @@ class OCPPService {
 
 		// ── CostUpdated ──
 		this.client.handle("CostUpdated", (ctx) => {
-			const params = ctx.params;
+			const params = ctx.params as { totalCost: number };
 			useEmulatorStore.getState().addLog(cid, {
 				direction: "Rx",
 				action: "CostUpdated",
@@ -1630,7 +1790,11 @@ class OCPPService {
 
 		// ── DisplayMessage ──
 		this.client.handle("DisplayMessage", (ctx) => {
-			const params = ctx.params;
+			const params = ctx.params as {
+				id?: number;
+				priority?: string;
+				message?: { content?: string };
+			};
 			useEmulatorStore.getState().addLog(cid, {
 				direction: "Rx",
 				action: "DisplayMessage",
@@ -1649,7 +1813,7 @@ class OCPPService {
 
 		// ── ClearDisplayMessage ──
 		this.client.handle("ClearDisplayMessage", (ctx) => {
-			const params = ctx.params;
+			const params = ctx.params as { id: number };
 			useEmulatorStore.getState().addLog(cid, {
 				direction: "Rx",
 				action: "ClearDisplayMessage",
@@ -1705,7 +1869,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = (await this.client.call(
+			const res = (await this.sendCall(
 				"BootNotification",
 				payload,
 			)) as {
@@ -1812,7 +1976,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call("TransactionEvent", payload);
+			const res = await this.sendCall("TransactionEvent", payload);
 			store.addLog(this.chargerId, {
 				direction: "Rx",
 				action: "TransactionEventConf",
@@ -1855,7 +2019,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			await this.client.call("StatusNotification", payload);
+			await this.sendCall("StatusNotification", payload);
 		} catch (err) {
 			store.addLog(this.chargerId, {
 				direction: "Error",
@@ -1878,7 +2042,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call("Authorize", payload);
+			const res = await this.sendCall("Authorize", payload);
 			store.addLog(this.chargerId, {
 				direction: "Rx",
 				action: "AuthorizeConf",
@@ -1982,7 +2146,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = (await this.client.call(
+			const res = (await this.sendCall(
 				"BootNotification",
 				payload,
 			)) as {
@@ -2008,6 +2172,7 @@ class OCPPService {
 						.getState()
 						.chargers.find((c) => c.id === this.chargerId)?.config
 						.numberOfConnectors ?? 1;
+				this.flushOfflineQueue();
 				const resumed = new Set(this.activeConnectorIds());
 				for (let i = 1; i <= n; i++)
 					if (!resumed.has(i)) this.sendStatusNotification(i, "Available");
@@ -2070,7 +2235,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call("Heartbeat", {});
+			const res = await this.sendCall("Heartbeat", {});
 			s.addLog(this.chargerId, {
 				direction: "Rx",
 				action: "HeartbeatConf",
@@ -2087,6 +2252,22 @@ class OCPPService {
 		}
 	}
 
+	/**
+	 * OCPP 1.6 connector status -> 2.0.1 ConnectorStatusEnumType, which only
+	 * has Available | Occupied | Reserved | Unavailable | Faulted.
+	 */
+	private static readonly STATUS_16_TO_201: Record<string, string> = {
+		Available: "Available",
+		Preparing: "Occupied",
+		Charging: "Occupied",
+		SuspendedEV: "Occupied",
+		SuspendedEVSE: "Occupied",
+		Finishing: "Occupied",
+		Reserved: "Reserved",
+		Unavailable: "Unavailable",
+		Faulted: "Faulted",
+	};
+
 	async sendStatusNotification(
 		connectorId: number,
 		status: string,
@@ -2094,6 +2275,23 @@ class OCPPService {
 	) {
 		if (!this.client) return;
 		const s = useEmulatorStore.getState();
+
+		// Callers (UI buttons, scenario steps) should not have to know which
+		// protocol version is configured. On 2.x the payload shape differs
+		// entirely, and sending the 1.6 shape gets rejected by a validating
+		// CSMS — which looks like "the status notification never fired".
+		const version = s.getSlot(this.chargerId)?.config.ocppVersion;
+		if (version && version !== "ocpp1.6") {
+			s.updateConnector(this.chargerId, connectorId, {
+				status: status as statusType,
+			});
+			await this.sendStatusNotification201(
+				connectorId,
+				1,
+				OCPPService.STATUS_16_TO_201[status] ?? "Available",
+			);
+			return;
+		}
 		const vendorError = s.getSlot(this.chargerId)?.config.vendorConfig
 			?.vendorErrorCode;
 
@@ -2114,7 +2312,7 @@ class OCPPService {
 			status: status as statusType,
 		});
 		try {
-			const res = await this.client.call("StatusNotification", payload);
+			const res = await this.sendCall("StatusNotification", payload);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
 				action: "StatusNotificationConf",
@@ -2142,7 +2340,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = (await this.client.call("Authorize", { idTag })) as {
+			const res = (await this.sendCall("Authorize", { idTag })) as {
 				idTagInfo: { status: string };
 			};
 			s.addLog(this.chargerId, {
@@ -2227,7 +2425,7 @@ class OCPPService {
 			ocppMessageId: txMsgId,
 		});
 		try {
-			const res = (await this.client.call(
+			const res = (await this.sendCall(
 				"StartTransaction",
 				payload,
 			)) as {
@@ -2416,7 +2614,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call("MeterValues", payload);
+			const res = await this.sendCall("MeterValues", payload);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
 				action: "MeterValuesConf",
@@ -2480,7 +2678,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call("StopTransaction", payload);
+			const res = await this.sendCall("StopTransaction", payload);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
 				action: "StopTransactionConf",
@@ -2526,7 +2724,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call(
+			const res = await this.sendCall(
 				"DiagnosticsStatusNotification",
 				payload,
 			);
@@ -2555,15 +2753,49 @@ class OCPPService {
 		for (const step of steps) {
 			cumulative += step.delay;
 			this.firmwareTimers.push(
-				setTimeout(() => {
+				setTimeout(async () => {
 					useEmulatorStore
 						.getState()
 						.updateSimulation(this.chargerId, {
 							firmwareStatus: step.status,
 						});
-					this.sendFirmwareStatus(step.status);
+					// A station cannot charge through an install: it ends any
+					// running session and reports itself Unavailable until the
+					// new firmware is in place.
+					if (step.status === "Installing")
+						await this.enterFirmwareInstall();
+					await this.sendFirmwareStatus(step.status);
+					if (step.status === "Installed")
+						await this.exitFirmwareInstall();
 				}, cumulative),
 			);
+		}
+	}
+
+	private connectorCount() {
+		return (
+			useEmulatorStore.getState().getSlot(this.chargerId)?.config
+				.numberOfConnectors ?? 1
+		);
+	}
+
+	private async enterFirmwareInstall() {
+		for (const connId of this.activeConnectorIds()) {
+			useEmulatorStore
+				.getState()
+				.updateConnector(this.chargerId, connId, {
+					stopReason: "Other",
+				});
+			await this.stopTransaction(connId, "Other");
+		}
+		for (let i = 1; i <= this.connectorCount(); i++) {
+			await this.sendStatusNotification(i, "Unavailable");
+		}
+	}
+
+	private async exitFirmwareInstall() {
+		for (let i = 1; i <= this.connectorCount(); i++) {
+			await this.sendStatusNotification(i, "Available");
 		}
 	}
 
@@ -2584,7 +2816,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call(
+			const res = await this.sendCall(
 				"FirmwareStatusNotification",
 				payload,
 			);
@@ -2662,7 +2894,7 @@ class OCPPService {
 			ocppMessageId: msgId,
 		});
 		try {
-			const res = await this.client.call("DataTransfer", payload);
+			const res = await this.sendCall("DataTransfer", payload);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
 				action: "DataTransferConf",
@@ -2693,7 +2925,7 @@ class OCPPService {
 			payload,
 		});
 		try {
-			const res = await this.client.call(
+			const res = await this.sendCall(
 				"SecurityEventNotification",
 				payload,
 			);
@@ -2723,7 +2955,7 @@ class OCPPService {
 			payload,
 		});
 		try {
-			const res = await this.client.call(
+			const res = await this.sendCall(
 				"LogStatusNotification",
 				payload,
 			);
@@ -2851,7 +3083,7 @@ class OCPPService {
 		const s = useEmulatorStore.getState();
 		s.addLog(this.chargerId, { direction: "Tx", action, payload });
 		try {
-			const res = await this.client.call(action, payload);
+			const res = await this.sendCall(action, payload);
 			s.addLog(this.chargerId, {
 				direction: "Rx",
 				action: `${action}Conf`,
@@ -2928,7 +3160,7 @@ class OCPPService {
 					payload: { ...payload, errorCode },
 				});
 				try {
-					const res = await this.client.call(
+					const res = await this.sendCall(
 						"StatusNotification",
 						payload,
 					);

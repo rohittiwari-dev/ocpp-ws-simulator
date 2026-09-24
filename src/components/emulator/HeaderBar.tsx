@@ -17,7 +17,7 @@ import { useAuth } from "@/components/emulator/AuthGate";
 import { LocalhostGuideDialog } from "@/components/emulator/LocalhostGuideDialog";
 import { ShortcutsDialog } from "@/components/emulator/ShortcutsDialog";
 import { useActiveCharger } from "@/hooks/useActiveCharger";
-import { type ConnectionStatus, useEmulatorStore } from "@/store/emulatorStore";
+import type { ConnectionStatus } from "@/store/emulatorStore";
 
 /* ── Status config ── */
 type StCfg = { dot: string; text: string; label: string };
@@ -38,9 +38,8 @@ function formatUptime(ms: number) {
 
 /* ── Header ── */
 export function HeaderBar({ onSettingsOpen }: { onSettingsOpen: () => void }) {
-  const { status, config, connectedAt, updateConfig, id, offlineMode } =
+  const { status, config, connectedAt, updateConfig, offlineMode } =
     useActiveCharger();
-  const store = useEmulatorStore();
   const auth = useAuth();
   const isConnected = status === "connected";
   const isConnecting = status === "connecting";
@@ -254,7 +253,11 @@ export function HeaderBar({ onSettingsOpen }: { onSettingsOpen: () => void }) {
               <Zap className="h-3 w-3" /> Heartbeat
             </button>
             <button
-              onClick={() => store.toggleOfflineMode(id)}
+              onClick={() =>
+                // Goes through the service so going back online actually
+                // replays what was queued while the station was dark.
+                runService((s) => s.setOfflineMode(!offlineMode))
+              }
               title={
                 offlineMode
                   ? "Go back online — flush queued messages"

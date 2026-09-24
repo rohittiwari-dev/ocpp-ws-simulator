@@ -198,7 +198,6 @@ export interface SimulationConfig {
   autoChargeTargetKWh: number;
   autoChargeDurationSec: number;
   autoChargeMeterIncrement: number;
-  autoChargeSocEnabled: boolean;
   // Measurands
   measurands: MeasurandsConfig;
   // Response latency simulation
@@ -521,11 +520,14 @@ function syncDerivedKeys(
 
   // ConnectorPhaseRotation: one entry per connector, per phase config
   const n = config.numberOfConnectors ?? 1;
-  const phaseStr = m?.threePhase
-    ? Array.from({ length: n }, (_, i) => `${i + 1}.NotApplicable`)
-        .flatMap((prefix) => ["L1", "L2", "L3"].map((ph) => `${prefix}`))
-        .join(",")
-    : Array.from({ length: n }, (_, i) => `${i + 1}.NotApplicable`).join(",");
+  // OCPP 1.6 ConnectorPhaseRotation is one "<connectorId>.<rotation>" entry
+  // per connector — not one per phase. RST is the standard three-phase
+  // rotation; single-phase connectors report NotApplicable.
+  const rotation = m?.threePhase ? "RST" : "NotApplicable";
+  const phaseStr = Array.from(
+    { length: n },
+    (_, i) => `${i + 1}.${rotation}`,
+  ).join(",");
 
   const overrides: Record<string, string> = {
     NumberOfConnectors: String(n),
@@ -546,7 +548,6 @@ const DEFAULT_SIMULATION: SimulationConfig = {
   autoChargeTargetKWh: 30,
   autoChargeDurationSec: 120,
   autoChargeMeterIncrement: 250,
-  autoChargeSocEnabled: true,
   measurands: DEFAULT_MEASURANDS,
   responseDelayMs: 0,
 };
