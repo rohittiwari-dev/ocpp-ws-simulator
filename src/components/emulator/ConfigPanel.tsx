@@ -7,6 +7,7 @@ import {
   Clock,
   Cpu,
   CreditCard,
+  ExternalLink,
   FileText,
   FlaskConical,
   Gauge,
@@ -35,6 +36,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { LocalhostGuideDialog } from "@/components/emulator/LocalhostGuideDialog";
 import { Input } from "@/components/ui/input";
 import { useActiveCharger } from "@/hooks/useActiveCharger";
 import { getService, ocppService } from "@/lib/ocppClient";
@@ -429,6 +431,21 @@ function ConnectionTab() {
             className="h-9 bg-surface-inset border-b-default text-white text-[12px] rounded-lg focus-visible:ring-blue-500/30"
             placeholder="ws://localhost:9000"
           />
+          <div className="mt-2 flex items-center justify-between text-[11px]">
+            <span className="text-t-muted text-[10px]">
+              Targeting local CSMS?
+            </span>
+            <LocalhostGuideDialog
+              trigger={
+                <button
+                  type="button"
+                  className="text-[#a78bfa] hover:text-[#c4b5fd] hover:underline flex items-center gap-1 text-[10px] cursor-pointer"
+                >
+                  Browser permission guide <ExternalLink className="h-2.5 w-2.5" />
+                </button>
+              }
+            />
+          </div>
         </Field>
       </SectionCard>
 

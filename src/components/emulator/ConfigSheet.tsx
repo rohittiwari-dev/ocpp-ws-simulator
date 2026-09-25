@@ -4,6 +4,7 @@ import {
   Clock,
   Cpu,
   CreditCard,
+  ExternalLink,
   FileText,
   FlaskConical,
   Gauge,
@@ -21,6 +22,7 @@ import {
   Upload,
   Wrench,
 } from "lucide-react";
+import { LocalhostGuideDialog } from "@/components/emulator/LocalhostGuideDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -94,6 +96,21 @@ function ConnectionTab() {
             className="glass-input text-white h-10"
             placeholder="ws://localhost:9000"
           />
+          <div className="mt-2 flex items-center justify-between text-[11px]">
+            <span className="text-[#6b7898] text-[10px]">
+              Targeting local CSMS?
+            </span>
+            <LocalhostGuideDialog
+              trigger={
+                <button
+                  type="button"
+                  className="text-[#a78bfa] hover:text-[#c4b5fd] hover:underline flex items-center gap-1 text-[10px] cursor-pointer"
+                >
+                  Browser permission guide <ExternalLink className="h-2.5 w-2.5" />
+                </button>
+              }
+            />
+          </div>
         </Field>
       </div>
 

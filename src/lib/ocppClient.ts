@@ -247,10 +247,20 @@ class OCPPService {
 						: "WebSocket error event";
 				const s = useEmulatorStore.getState();
 				s.setStatus(this.chargerId, "faulted");
+				const isHttps =
+					typeof window !== "undefined" && window.location.protocol === "https:";
+				const isLocal =
+					config.endpoint.includes("localhost") ||
+					config.endpoint.includes("127.0.0.1");
+				const payload: Record<string, unknown> = { message };
+				if (isHttps && isLocal) {
+					payload.hint =
+						"Connecting to ws://localhost from HTTPS? Your browser may block insecure WebSockets. Allow 'Insecure content' or 'Local network access' in site settings, or open the Localhost Guide in the header.";
+				}
 				s.addLog(this.chargerId, {
 					direction: "Error",
 					action: "WebSocket Error",
-					payload: { message },
+					payload,
 				});
 			});
 
